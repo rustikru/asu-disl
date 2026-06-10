@@ -255,11 +255,14 @@ def fetch_latest_excel_from_folder(target_dir: Path, tab: str, source_folder: Pa
 
     try:
         if _needs_header:
-            # load_excel_as_df пропускает первые 2 строки — вставляем заголовочные строки
+            # load_excel_as_df пропускает первые 2 строки — вставляем заголовочные строки.
+            # A1 должен содержать дату, чтобы parse_report_datetime мог её извлечь.
+            _file_dt = datetime.fromtimestamp(latest_mtime)
+            _header_text = f"Дислокация ТУ на {_file_dt.strftime('%d.%m.%Y %H:%M')}"
             _wb = _openpyxl.load_workbook(latest_file)
             _ws = _wb.active
             _ws.insert_rows(1, amount=2)
-            _ws["A1"] = "Дислокация ТУ"
+            _ws["A1"] = _header_text
             _wb.save(str(local_path))
         else:
             shutil.copy2(latest_file, local_path)
