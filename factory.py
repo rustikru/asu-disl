@@ -1916,10 +1916,12 @@ def create_app(default_excel: Optional[str] = None) -> Flask:
                 except Exception:
                     pass
                 return None
+            is_from_folder = result.signature.startswith("folder::")
+            source_name = f"Папка: {result.display_name}" if is_from_folder else f"Почта: {result.display_name}"
             candidate_state = build_state_from_path(
                 result.file_path,
                 mode=tab,
-                source_name=f"Почта: {result.display_name}",
+                source_name=source_name,
                 source_kind="mail",
                 mail_signature=result.signature,
             )
@@ -1929,7 +1931,8 @@ def create_app(default_excel: Optional[str] = None) -> Flask:
                     Path(result.file_path).unlink(missing_ok=True)
                 except Exception:
                     pass
-                set_error(f"Новая справка из почты отклонена: {reason} Сохранена предыдущая рабочая версия.")
+                source_label = "из папки" if is_from_folder else "из почты"
+                set_error(f"Новая справка {source_label} отклонена: {reason} Сохранена предыдущая рабочая версия.")
                 return None
             apply_loaded_state(tab, candidate_state)
             return result
@@ -1955,8 +1958,6 @@ def create_app(default_excel: Optional[str] = None) -> Flask:
         updated: list[str] = []
         errors: dict[str, str] = {}
         for tab in (TAB_APPROACH, TAB_DEPARTURE):
-            if not email_enabled(tab):
-                continue
             try:
                 result = try_mail_sync(tab, force=False)
                 if result is not None:
@@ -4693,12 +4694,12 @@ tr.asu-selected-station-always-visible > td *{{color:#c00000 !important;}}
         display_tab = get_tab_name(request.args.get("tab"))
         idle_view = get_idle_view(request.args.get("idle_view"))
         tab = get_station_idle_source_tab(idle_view) if display_tab == TAB_STATION_IDLE else get_source_tab(display_tab)
-        if not email_enabled(tab):
-            return jsonify({"updated": False, "enabled": False, "tab": display_tab})
         try:
             result = try_mail_sync(tab, force=False)
             return jsonify({"updated": bool(result), "enabled": True, "tab": display_tab})
         except Exception as exc:
+            if not email_enabled(tab):
+                return jsonify({"updated": False, "enabled": False, "tab": display_tab})
             return jsonify({"updated": False, "enabled": True, "tab": display_tab, "error": str(exc)})
 
     @app.route("/reload-last")
