@@ -242,9 +242,27 @@ def fetch_latest_excel_from_folder(target_dir: Path, tab: str, source_folder: Pa
     dated_prefix = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_name = secure_filename(latest_file.name) or "data.xlsx"
     local_path = target_dir / f"{tab}_{dated_prefix}_{safe_name}"
-    
+
     try:
-        shutil.copy2(latest_file, local_path)
+        import openpyxl as _openpyxl
+        _wb = _openpyxl.load_workbook(latest_file, read_only=True)
+        _ws = _wb.active
+        _first = [c.value for c in next(_ws.iter_rows(min_row=1, max_row=1))]
+        _wb.close()
+        _needs_header = any(v and "Номер вагона" in str(v) for v in _first)
+    except Exception:
+        _needs_header = False
+
+    try:
+        if _needs_header:
+            # load_excel_as_df пропускает первые 2 строки — вставляем заголовочные строки
+            _wb = _openpyxl.load_workbook(latest_file)
+            _ws = _wb.active
+            _ws.insert_rows(1, amount=2)
+            _ws["A1"] = "Дислокация ТУ"
+            _wb.save(str(local_path))
+        else:
+            shutil.copy2(latest_file, local_path)
     except Exception as e:
         raise ValueError(f"Не удалось скопировать файл: {e}")
     
