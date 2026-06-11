@@ -249,20 +249,35 @@ def fetch_latest_excel_from_folder(target_dir: Path, tab: str, source_folder: Pa
         _ws = _wb.active
         _first = [c.value for c in next(_ws.iter_rows(min_row=1, max_row=1))]
         _wb.close()
+        # Если строка 1 содержит "Номер вагона" — это новый формат (без заголовка).
+        # Нужно вставить 3 строки заголовка, как в формате почтового отчёта:
+        #   Row 1: (пусто)
+        #   Row 2: "DD.MM.YYYY HH:MM"  ← parse_report_datetime читает именно отсюда
+        #   Row 3: "Данные о вагоне"
+        #   Row 4: "Номер вагона", ...   ← заголовок столбцов (skiprows=3 в load_excel_as_df)
         _needs_header = any(v and "Номер вагона" in str(v) for v in _first)
     except Exception:
         _needs_header = False
 
     try:
         if _needs_header:
-            # load_excel_as_df пропускает первые 2 строки — вставляем заголовочные строки.
-            # A1 должен содержать дату, чтобы parse_report_datetime мог её извлечь.
-            _file_dt = datetime.fromtimestamp(latest_mtime)
-            _header_text = f"Дислокация ТУ на {_file_dt.strftime('%d.%m.%Y %H:%M')}"
+            import re as _re
+            # Извлекаем дату из имени файла вида *_DDMMYYYY_HHMM.xlsx
+            _dt_match = _re.search(r'(\d{2})(\d{2})(\d{4})_(\d{2})(\d{2})$', latest_file.stem)
+            if _dt_match:
+                _d, _m, _y, _h, _mi = _dt_match.groups()
+                try:
+                    _file_dt = datetime(int(_y), int(_m), int(_d), int(_h), int(_mi))
+                except ValueError:
+                    _file_dt = datetime.fromtimestamp(latest_mtime)
+            else:
+                _file_dt = datetime.fromtimestamp(latest_mtime)
+            _date_str = _file_dt.strftime("%d.%m.%Y %H:%M")
             _wb = _openpyxl.load_workbook(latest_file)
             _ws = _wb.active
-            _ws.insert_rows(1, amount=2)
-            _ws["A1"] = _header_text
+            _ws.insert_rows(1, amount=3)
+            _ws["A2"] = _date_str  # дата в A2, как в почтовом формате
+            _ws["A3"] = "Данные о вагоне"
             _wb.save(str(local_path))
         else:
             shutil.copy2(latest_file, local_path)
