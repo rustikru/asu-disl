@@ -20,14 +20,26 @@ class RawIMAP {
     private $socket = null;
     private int $tag = 0;
 
-    public function connect(string $host, int $port, int $timeout = 30): bool {
+    /**
+     * $mode: 'ssl' — прямой TLS (порт 993)
+     *        'tls' — STARTTLS поверх plain (порт 143)
+     *        'plain' — без шифрования (порт 143)
+     * По умолчанию: порт 993 → ssl, порт 143 → tls (STARTTLS), остальное → ssl
+     */
+    public function connect(string $host, int $port, int $timeout = 30, string $mode = 'auto'): bool {
+        if ($mode === 'auto') {
+            $mode = ($port === 143) ? 'tls' : 'ssl';
+        }
+
         $ctx = stream_context_create(['ssl' => [
             'verify_peer'      => false,
             'verify_peer_name' => false,
             'allow_self_signed'=> true,
         ]]);
+
+        $scheme = ($mode === 'ssl') ? 'ssl' : 'tcp';
         $this->socket = @stream_socket_client(
-            "ssl://{$host}:{$port}", $errno, $errstr, $timeout,
+            "{$scheme}://{$host}:{$port}", $errno, $errstr, $timeout,
             STREAM_CLIENT_CONNECT, $ctx
         );
         if (!$this->socket) {
@@ -36,6 +48,26 @@ class RawIMAP {
         }
         stream_set_timeout($this->socket, $timeout);
         $this->readLine(); // приветствие сервера
+
+        if ($mode === 'tls') {
+            // STARTTLS: сначала запрашиваем возможности, потом апгрейдим
+            $caps = $this->cmd('CAPABILITY');
+            $hasTls = false;
+            foreach ($caps as $l) {
+                if (stripos($l, 'STARTTLS') !== false) { $hasTls = true; break; }
+            }
+            if ($hasTls) {
+                $this->cmd('STARTTLS');
+                if (!stream_socket_enable_crypto($this->socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+                    echo "[ERROR] STARTTLS: не удалось включить шифрование.\n";
+                    return false;
+                }
+                echo "[INFO] STARTTLS активирован.\n";
+            } else {
+                echo "[WARN] Сервер не поддерживает STARTTLS, работаем без шифрования.\n";
+            }
+        }
+
         return true;
     }
 
@@ -265,6 +297,7 @@ function load_settings(): array {
 function get_imap_cfg(array $s, string $tab): array {
     $def = [
         'enabled' => false, 'server' => '', 'port' => 993,
+        'ssl_mode' => 'auto',   // 'ssl' | 'tls' (STARTTLS) | 'plain' | 'auto'
         'username' => '', 'password' => '', 'mailbox' => 'INBOX',
         'sender_filter' => '', 'subject_filter' => '',
         'subject_equals' => '', 'attachment_name_contains' => '',
@@ -299,6 +332,7 @@ function save_file(string $tab, string $day, string $orig_name, string $data): v
 function fetch_from_imap(array $cfg, string $tab): void {
     $server   = trim($cfg['server']   ?? '');
     $port     = (int)($cfg['port']    ?? 993);
+    $ssl_mode = trim($cfg['ssl_mode'] ?? 'auto');
     $username = trim($cfg['username'] ?? '');
     $password =      $cfg['password'] ?? '';
     $mailbox  = trim($cfg['mailbox']  ?? '') ?: 'INBOX';
@@ -314,10 +348,10 @@ function fetch_from_imap(array $cfg, string $tab): void {
     $attachment_name_contains = strtolower(trim($cfg['attachment_name_contains'] ?? ''));
     $attachment_name_equals   = strtolower(trim($cfg['attachment_name_equals']   ?? ''));
 
-    echo "[INFO] Подключаюсь: {$server}:{$port} / {$mailbox}\n";
+    echo "[INFO] Подключаюсь: {$server}:{$port} [{$ssl_mode}] / {$mailbox}\n";
 
     $imap = new RawIMAP();
-    if (!$imap->connect($server, $port)) return;
+    if (!$imap->connect($server, $port, 30, $ssl_mode)) return;
     if (!$imap->login($username, $password)) {
         echo "[ERROR] Ошибка авторизации.\n";
         $imap->logout(); return;
