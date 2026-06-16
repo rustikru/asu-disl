@@ -1,27 +1,26 @@
 <?php
 /**
  * fetch_excel.php
- * Скачивает Excel-файлы из IMAP-почты и копирует из локальных папок
- * в директорию, где лежит этот скрипт.
+ * Скачивает последний Excel-файл за каждый день за последние 2 недели
+ * из IMAP-почты или из локальных папок approach/ / departure/.
+ * Все файлы сохраняются в директорию, где лежит этот скрипт.
  *
- * Настройки берутся из ~/ASU_PODHOD/settings.json
- * Запуск: php fetch_excel.php
+ * Настройки: ~/ASU_PODHOD/settings.json
+ * Запуск:    php fetch_excel.php
  */
 
 define('EXCEL_EXTS', ['xlsx', 'xls', 'xlsm', 'xltx', 'xltm']);
-define('OUTPUT_DIR', __DIR__ . '/');
+define('OUTPUT_DIR',  __DIR__ . '/');
+define('DAYS_BACK',   14);
 
-// ── Найти settings.json ───────────────────────────────────────────────────────
+// ── settings.json ─────────────────────────────────────────────────────────────
 
 function find_settings_file(): ?string {
-    $candidates = [
-        getenv('APPDATA')   ? getenv('APPDATA')   . '/ASU_PODHOD/settings.json' : null,
-        getenv('LOCALAPPDATA') ? getenv('LOCALAPPDATA') . '/ASU_PODHOD/settings.json' : null,
-        getenv('HOME')      ? getenv('HOME')       . '/ASU_PODHOD/settings.json' : null,
-    ];
-    foreach ($candidates as $path) {
-        if ($path && file_exists($path)) {
-            return $path;
+    foreach (['APPDATA', 'LOCALAPPDATA', 'HOME'] as $env) {
+        $base = getenv($env);
+        if ($base) {
+            $path = rtrim($base, '/\\') . '/ASU_PODHOD/settings.json';
+            if (file_exists($path)) return $path;
         }
     }
     return null;
@@ -33,74 +32,73 @@ function load_settings(): array {
         echo "[WARN] settings.json не найден, используются пустые настройки.\n";
         return [];
     }
-    echo "[INFO] Читаю настройки: $path\n";
+    echo "[INFO] Настройки: $path\n";
     $data = json_decode(file_get_contents($path), true);
     return is_array($data) ? $data : [];
 }
 
 function get_imap_cfg(array $settings, string $tab): array {
     $default = [
-        'enabled'                 => false,
-        'server'                  => '',
-        'port'                    => 993,
-        'username'                => '',
-        'password'                => '',
-        'mailbox'                 => 'INBOX',
-        'sender_filter'           => '',
-        'subject_filter'          => '',
-        'subject_equals'          => '',
-        'attachment_name_contains'=> '',
-        'attachment_name_equals'  => '',
+        'enabled'                  => false,
+        'server'                   => '',
+        'port'                     => 993,
+        'username'                 => '',
+        'password'                 => '',
+        'mailbox'                  => 'INBOX',
+        'sender_filter'            => '',
+        'subject_filter'           => '',
+        'subject_equals'           => '',
+        'attachment_name_contains' => '',
+        'attachment_name_equals'   => '',
     ];
     $legacy = $settings['imap'] ?? [];
-    if ($tab === 'approach') {
-        return array_merge($default, $legacy, $settings['imap_approach'] ?? []);
-    }
-    return array_merge($default, $settings['imap_departure'] ?? []);
+    $key    = $tab === 'approach' ? 'imap_approach' : 'imap_departure';
+    return array_merge($default, $legacy, $settings[$key] ?? []);
 }
 
-// ── Проверка расширения файла ─────────────────────────────────────────────────
+// ── Вспомогательные ───────────────────────────────────────────────────────────
 
 function is_excel(string $name): bool {
-    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-    return in_array($ext, EXCEL_EXTS, true);
+    return in_array(strtolower(pathinfo($name, PATHINFO_EXTENSION)), EXCEL_EXTS, true);
 }
-
-// ── Безопасное имя файла ──────────────────────────────────────────────────────
 
 function safe_filename(string $name): string {
-    $name = preg_replace('/[^\w.\-]/u', '_', $name);
-    return $name ?: 'attachment.xlsx';
+    return preg_replace('/[^\w.\-]/u', '_', $name) ?: 'attachment.xlsx';
 }
 
-// ── Декодирование MIME-заголовка ──────────────────────────────────────────────
-
 function decode_mime(string $value): string {
-    $decoded = imap_mime_header_decode($value);
-    $result = '';
-    foreach ($decoded as $part) {
-        $charset = strtolower($part->charset ?? 'utf-8');
-        $text    = $part->text ?? '';
+    if (!function_exists('imap_mime_header_decode')) return $value;
+    $parts = imap_mime_header_decode($value);
+    $out   = '';
+    foreach ($parts as $p) {
+        $text    = $p->text ?? '';
+        $charset = strtolower($p->charset ?? 'utf-8');
         if ($charset !== 'utf-8' && $charset !== 'default') {
             $text = mb_convert_encoding($text, 'UTF-8', $charset);
         }
-        $result .= $text;
+        $out .= $text;
     }
-    return $result;
+    return $out;
 }
 
-// ── Сохранить файл в OUTPUT_DIR ───────────────────────────────────────────────
-
-function save_file(string $prefix, string $original_name, string $content): void {
-    $ts       = date('Ymd_His');
-    $safe     = safe_filename($original_name);
-    $filename = "{$prefix}_{$ts}_{$safe}";
-    $dest     = OUTPUT_DIR . $filename;
+/**
+ * Сохраняет файл. Имя: {tab}_{YYYY-MM-DD}_{safe_original}.xlsx
+ * Если файл с таким именем уже существует — пропускает (день уже загружен).
+ * Возвращает true если файл сохранён, false если пропущен.
+ */
+function save_file(string $tab, string $day, string $original_name, string $content): bool {
+    $safe = safe_filename($original_name);
+    $dest = OUTPUT_DIR . "{$tab}_{$day}_{$safe}";
+    if (file_exists($dest)) {
+        echo "  [SKIP] Уже есть: " . basename($dest) . "\n";
+        return false;
+    }
     file_put_contents($dest, $content);
-    echo "[OK]   Сохранён: $filename\n";
+    echo "  [OK]   Сохранён: " . basename($dest) . "\n";
+    return true;
 }
 
-// ── Получить файлы из IMAP ────────────────────────────────────────────────────
+// ── IMAP ──────────────────────────────────────────────────────────────────────
 
 function fetch_from_imap(array $cfg, string $tab): void {
     if (empty($cfg['enabled'])) {
@@ -108,7 +106,7 @@ function fetch_from_imap(array $cfg, string $tab): void {
         return;
     }
     if (!function_exists('imap_open')) {
-        echo "[ERROR] Расширение PHP IMAP не установлено (php-imap).\n";
+        echo "[ERROR] Расширение php-imap не установлено.\n";
         return;
     }
 
@@ -119,62 +117,69 @@ function fetch_from_imap(array $cfg, string $tab): void {
     $mailbox  = trim($cfg['mailbox'] ?? '') ?: 'INBOX';
 
     if (!$server || !$username || !$password) {
-        echo "[SKIP] IMAP для '$tab': не заполнены server/username/password.\n";
+        echo "[SKIP] Не заполнены server/username/password для '$tab'.\n";
         return;
     }
 
-    $sender_filter            = strtolower(trim($cfg['sender_filter'] ?? ''));
-    $subject_filter           = strtolower(trim($cfg['subject_filter'] ?? ''));
-    $subject_equals           = strtolower(trim($cfg['subject_equals'] ?? ''));
+    $sender_filter            = strtolower(trim($cfg['sender_filter']            ?? ''));
+    $subject_filter           = strtolower(trim($cfg['subject_filter']           ?? ''));
+    $subject_equals           = strtolower(trim($cfg['subject_equals']           ?? ''));
     $attachment_name_contains = strtolower(trim($cfg['attachment_name_contains'] ?? ''));
-    $attachment_name_equals   = strtolower(trim($cfg['attachment_name_equals'] ?? ''));
+    $attachment_name_equals   = strtolower(trim($cfg['attachment_name_equals']   ?? ''));
 
     $mbox_str = "{{$server}:{$port}/imap/ssl}{$mailbox}";
-    echo "[INFO] Подключаюсь к IMAP: $mbox_str\n";
+    echo "[INFO] Подключаюсь: $mbox_str\n";
 
     $imap = @imap_open($mbox_str, $username, $password, 0, 1);
     if (!$imap) {
-        echo "[ERROR] Не удалось подключиться: " . imap_last_error() . "\n";
+        echo "[ERROR] " . imap_last_error() . "\n";
         return;
     }
 
-    // Письма за последние сутки
-    $since = date('d-M-Y', strtotime('-1 day'));
-    $uids  = imap_search($imap, "SINCE \"$since\"");
-    if (!$uids) {
-        echo "[INFO] Нет писем за последние сутки (tab=$tab).\n";
-        imap_close($imap);
-        return;
-    }
+    // Поиск писем за последние DAYS_BACK дней
+    $since = date('d-M-Y', strtotime('-' . DAYS_BACK . ' days'));
+    $uids  = imap_search($imap, "SINCE \"$since\"") ?: [];
 
-    $found = 0;
-    foreach (array_reverse($uids) as $uid) {
+    echo "[INFO] Найдено писем за " . DAYS_BACK . " дней: " . count($uids) . "\n";
+
+    // Группируем по дню: day => [uid, ...] (от старых к новым)
+    // Берём последнее (самое позднее) письмо с вложением за каждый день.
+    $by_day = [];   // ['2026-06-10' => ['uid' => N, 'ts' => T]]
+    foreach ($uids as $uid) {
         $header = imap_headerinfo($imap, $uid);
 
-        // Фильтр по отправителю
         if ($sender_filter) {
             $from = strtolower($header->fromaddress ?? '');
             if (strpos($from, $sender_filter) === false) continue;
         }
 
-        // Фильтр по теме
         $subject = strtolower(decode_mime($header->subject ?? ''));
         if ($subject_equals && $subject !== $subject_equals) continue;
         if ($subject_filter && strpos($subject, $subject_filter) === false) continue;
 
-        // Разбор вложений
+        // Дата письма
+        $ts  = strtotime($header->date ?? '') ?: 0;
+        $day = date('Y-m-d', $ts);
+
+        // Оставляем самое позднее за каждый день
+        if (!isset($by_day[$day]) || $ts > $by_day[$day]['ts']) {
+            $by_day[$day] = ['uid' => $uid, 'ts' => $ts];
+        }
+    }
+
+    ksort($by_day);   // по возрастанию дат
+    echo "[INFO] Дней с подходящими письмами: " . count($by_day) . "\n\n";
+
+    foreach ($by_day as $day => $info) {
+        $uid       = $info['uid'];
         $structure = imap_fetchstructure($imap, $uid);
         $parts     = $structure->parts ?? [];
 
+        $saved = false;
         foreach ($parts as $i => $part) {
-            // Disposition: attachment
-            $disp = '';
-            if (!empty($part->disposition)) {
-                $disp = strtolower($part->disposition);
-            }
+            $disp = strtolower($part->disposition ?? '');
             if ($disp !== 'attachment') continue;
 
-            // Имя файла
             $filename = '';
             foreach ($part->dparameters ?? [] as $param) {
                 if (strtolower($param->attribute) === 'filename') {
@@ -189,44 +194,38 @@ function fetch_from_imap(array $cfg, string $tab): void {
             if (!$filename || !is_excel($filename)) continue;
 
             $lower = strtolower($filename);
-            if ($attachment_name_equals && $lower !== $attachment_name_equals) continue;
+            if ($attachment_name_equals   && $lower !== $attachment_name_equals)             continue;
             if ($attachment_name_contains && strpos($lower, $attachment_name_contains) === false) continue;
 
-            // Загрузка тела части (part index начинается с 1)
-            $part_num = $i + 1;
-            $body     = imap_fetchbody($imap, $uid, (string)$part_num);
-
-            // Декодирование
+            $body = imap_fetchbody($imap, $uid, (string)($i + 1));
             switch ($part->encoding ?? 0) {
-                case 3: $body = base64_decode($body);        break; // BASE64
-                case 4: $body = quoted_printable_decode($body); break; // QP
+                case 3: $body = base64_decode($body);           break;
+                case 4: $body = quoted_printable_decode($body); break;
             }
-
             if (!$body) continue;
 
-            save_file($tab, $filename, $body);
-            $found++;
-            break; // берём первое подходящее вложение из письма
+            echo "  $day  ";
+            save_file($tab, $day, $filename, $body);
+            $saved = true;
+            break;
         }
-    }
-
-    if ($found === 0) {
-        echo "[INFO] Подходящих вложений не найдено (tab=$tab).\n";
+        if (!$saved) {
+            echo "  $day  [SKIP] Нет Excel-вложения.\n";
+        }
     }
 
     imap_close($imap);
 }
 
-// ── Копировать файлы из локальной папки ──────────────────────────────────────
+// ── Локальная папка ───────────────────────────────────────────────────────────
 
+/**
+ * Для локальной папки: берём все файлы,
+ * группируем по дню на основе mtime и сохраняем последний за каждый день.
+ */
 function fetch_from_folder(string $tab): void {
-    // Ищем папку tab/ рядом со скриптом и на уровень выше
-    $candidates = [
-        __DIR__ . "/$tab",
-        dirname(__DIR__) . "/$tab",
-    ];
-
-    $folder = null;
+    $candidates = [__DIR__ . "/$tab", dirname(__DIR__) . "/$tab"];
+    $folder     = null;
     foreach ($candidates as $c) {
         if (is_dir($c)) { $folder = $c; break; }
     }
@@ -235,47 +234,64 @@ function fetch_from_folder(string $tab): void {
         echo "[SKIP] Папка '$tab' не найдена рядом со скриптом.\n";
         return;
     }
-
     echo "[INFO] Читаю папку: $folder\n";
 
-    $latest_file  = null;
-    $latest_mtime = 0;
-
+    // Собираем все Excel-файлы с их mtime
+    $files = [];
     foreach (EXCEL_EXTS as $ext) {
         foreach (glob("$folder/*.$ext") ?: [] as $f) {
-            $mtime = filemtime($f);
-            if ($mtime > $latest_mtime) {
-                $latest_mtime = $mtime;
-                $latest_file  = $f;
-            }
+            $files[] = ['path' => $f, 'mtime' => filemtime($f)];
         }
     }
 
-    if (!$latest_file) {
-        echo "[SKIP] В папке '$folder' нет Excel-файлов.\n";
+    if (!$files) {
+        echo "[SKIP] В папке нет Excel-файлов.\n";
         return;
     }
 
-    $original_name = basename($latest_file);
-    $ts       = date('Ymd_His');
-    $safe     = safe_filename($original_name);
-    $dest     = OUTPUT_DIR . "{$tab}_{$ts}_{$safe}";
-    copy($latest_file, $dest);
-    echo "[OK]   Скопирован: " . basename($dest) . " (из $folder)\n";
+    // Группируем по дню mtime, берём последний
+    $by_day = [];
+    foreach ($files as $f) {
+        $day = date('Y-m-d', $f['mtime']);
+        if (!isset($by_day[$day]) || $f['mtime'] > $by_day[$day]['mtime']) {
+            $by_day[$day] = $f;
+        }
+    }
+
+    // Ограничиваем последними DAYS_BACK днями
+    $cutoff = strtotime('-' . DAYS_BACK . ' days');
+    ksort($by_day);
+
+    echo "[INFO] Дней с файлами: " . count($by_day) . "\n\n";
+
+    foreach ($by_day as $day => $f) {
+        if ($f['mtime'] < $cutoff) {
+            echo "  $day  [SKIP] Старше " . DAYS_BACK . " дней.\n";
+            continue;
+        }
+        $name = basename($f['path']);
+        echo "  $day  ";
+        $dest = OUTPUT_DIR . "{$tab}_{$day}_" . safe_filename($name);
+        if (file_exists($dest)) {
+            echo "[SKIP] Уже есть: " . basename($dest) . "\n";
+            continue;
+        }
+        copy($f['path'], $dest);
+        echo "[OK]   Скопирован: " . basename($dest) . "\n";
+    }
 }
 
 // ── Точка входа ───────────────────────────────────────────────────────────────
 
-echo "=== fetch_excel.php ===\n";
+echo "=== fetch_excel.php (" . DAYS_BACK . " дней) ===\n";
 echo "Сохранение в: " . OUTPUT_DIR . "\n\n";
 
 $settings = load_settings();
 
 foreach (['approach', 'departure'] as $tab) {
-    echo "--- $tab ---\n";
+    echo "━━━ $tab ━━━\n";
     $cfg = get_imap_cfg($settings, $tab);
 
-    // Сначала пробуем почту, потом локальную папку
     if (!empty($cfg['enabled'])) {
         fetch_from_imap($cfg, $tab);
     } else {
