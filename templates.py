@@ -3243,7 +3243,7 @@ MAP_BODY = """
     <div class="meta">{{ current_tab_label }}{% if filter_caption %} • {{ filter_caption }}{% endif %}{% if archive_date %} • Архив: {{ archive_date }}{% endif %}</div>
   </div>
   <div class="topbar-right">
-    <a class="btn btn-secondary" href="{{ back_url }}">Назад</a>
+    <a class="btn btn-secondary" href="{{ back_url }}" data-no-loading="1">Назад</a>
   </div>
 </section>
 
@@ -3396,6 +3396,12 @@ MAP_BODY = """
     console.error(error);
     ensureStatus(error && error.message ? error.message : 'Не удалось загрузить карту.');
   });
+
+  window.addEventListener('pageshow', function(event) {
+    if (event.persisted && map) {
+      window.setTimeout(() => map.invalidateSize(), 0);
+    }
+  });
 })();
-</script></script>
+</script>
 """
